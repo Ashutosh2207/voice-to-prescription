@@ -179,17 +179,6 @@ PipelineConfig(
 └── requirements.txt
 ```
 
-## Adding New Medicines
-
-Edit `app/pipeline/nlp_extractor.py` — add to `medicine_names` list:
-
-```python
-medicine_names = [
-    "paracetamol", "ibuprofen", "your_new_medicine",  # Add here
-    ...
-]
-```
-
 ## Validation Rules
 
 - **Required**: medicineName
