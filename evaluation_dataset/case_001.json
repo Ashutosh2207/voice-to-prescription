@@ -1,0 +1,34 @@
+{
+  "referenceTranscript": "Aspirin 100 mg tablet morning and evening after food for two days. Paracetamol 500 mg tablet three times a day after food for three days. Amoxicillin 500 mg capsule morning and evening after food for five days.",
+  "referencePrescription": {
+    "prescription": [
+      {
+        "name": "ASPIRIN",
+        "form": "TABLET",
+        "dosage": "100MG",
+        "numberOfTime": "1-0-1",
+        "remarks": "AFTER FOOD",
+        "timesPerDay": "2 DAYS",
+        "unitPerTime": "1"
+      },
+      {
+        "name": "PARACETAMOL",
+        "form": "TABLET",
+        "dosage": "500MG",
+        "numberOfTime": "1-1-1",
+        "remarks": "AFTER FOOD",
+        "timesPerDay": "3 DAYS",
+        "unitPerTime": "1"
+      },
+      {
+        "name": "AMOXICILLIN",
+        "form": "CAPSULE",
+        "dosage": "500MG",
+        "numberOfTime": "1-0-1",
+        "remarks": "AFTER FOOD",
+        "timesPerDay": "5 DAYS",
+        "unitPerTime": "1"
+      }
+    ]
+  }
+}

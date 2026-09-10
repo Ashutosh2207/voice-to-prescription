@@ -1,4 +1,5 @@
 import time
+import asyncio
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
 
@@ -13,6 +14,7 @@ from app.models.schemas import (
 )
 
 from app.pipeline.stt import get_stt
+
 from app.pipeline.ollama_extractor import (
     get_ollama_extractor,
     OllamaPrescriptionExtractor,
@@ -21,6 +23,10 @@ from app.pipeline.ollama_extractor import (
 
 from app.pipeline.validator import get_validator
 from app.pipeline.transformer import get_transformer
+
+from app.pipeline.medical_terminology import (
+    get_medical_terminology_service,
+)
 
 from app.utils.audio_utils import (
     decode_base64_audio,
@@ -37,7 +43,6 @@ from app.utils.audio_utils import (
 class PipelineConfig:
 
     # Local Whisper model
-   
     whisper_model: str = "base"
 
     # Ollama is ALWAYS enabled
@@ -52,6 +57,7 @@ class PipelineConfig:
 
     spacy_model: str = "en_core_web_sm"
 
+    # Language
     language: str = "en"
 
 
@@ -67,13 +73,15 @@ class VoiceToPrescriptionPipeline:
 
         Audio
           ↓
-        faster-whisper
+        faster-whisper BASE
           ↓
-        Transcript
+        Raw Transcript
           ↓
         Ollama / ministral-3:3b
           ↓
         Medicine extraction
+          ↓
+        Medical terminology normalization
           ↓
         Validation
           ↓
@@ -89,9 +97,20 @@ class VoiceToPrescriptionPipeline:
 
         self.config = config or PipelineConfig()
 
+        # faster-whisper does not accept "auto" as a language code.
+        # Normalize automatic/empty language values to English.
+        if (
+            not self.config.language
+            or self.config.language.lower() == "auto"
+        ):
+            self.config.language = "en"
+
         # ----------------------------------------------------
         # Speech-to-text
         # ----------------------------------------------------
+
+        # Always use BASE Whisper.
+        self.config.whisper_model = "base"
 
         self.stt = get_stt(
             self.config.whisper_model
@@ -102,6 +121,14 @@ class VoiceToPrescriptionPipeline:
         # ----------------------------------------------------
 
         self.validator = get_validator()
+
+        # ----------------------------------------------------
+        # Medical terminology service
+        # ----------------------------------------------------
+
+        self.medical_terminology = (
+            get_medical_terminology_service()
+        )
 
         # ----------------------------------------------------
         # Ollama
@@ -118,8 +145,10 @@ class VoiceToPrescriptionPipeline:
             )
         )
 
-        self.ollama_extractor = get_ollama_extractor(
-            ollama_cfg
+        self.ollama_extractor = (
+            get_ollama_extractor(
+                ollama_cfg
+            )
         )
 
         # ----------------------------------------------------
@@ -127,6 +156,179 @@ class VoiceToPrescriptionPipeline:
         # ----------------------------------------------------
 
         self.transformer = get_transformer()
+
+        # ----------------------------------------------------
+        # Seed known medical vocabulary
+        # ----------------------------------------------------
+
+        self._seed_known_medicines()
+
+    # ========================================================
+    # SEED KNOWN MEDICINES
+    # ========================================================
+
+    def _seed_known_medicines(self):
+        """
+        Seed the terminology database with medicines already
+        maintained by the extraction layer.
+
+        This is NOT the final medical database.
+        It is a local cache/bootstrap vocabulary.
+        """
+
+        try:
+
+            known_medicines = (
+                self.ollama_extractor.KNOWN_MEDICINES
+            )
+
+            for medicine in known_medicines:
+
+                self.medical_terminology.save_term(
+                    term=medicine,
+                    normalized_name=medicine,
+                    rxcui=None,
+                    source="local_known_medicine"
+                )
+
+        except Exception as e:
+
+            print(
+                "Medical terminology bootstrap warning:"
+            )
+
+            print(
+                f"{type(e).__name__}: {e}"
+            )
+
+    # ========================================================
+    # NORMALIZE MEDICINE NAME
+    # ========================================================
+
+    def _normalize_medicine_name(
+        self,
+        medicine_name: str
+    ) -> str:
+        """
+        Resolve an extracted medicine name against the local
+        terminology cache and standardized terminology.
+
+        IMPORTANT:
+        - Only medicine names are resolved.
+        - No arbitrary transcript words are converted.
+        - Low-confidence matches are NOT automatically accepted.
+        """
+
+        if not medicine_name:
+            return medicine_name
+
+        original_name = (
+            str(medicine_name).strip()
+        )
+
+        if not original_name:
+            return original_name
+
+        try:
+
+            # ------------------------------------------------
+            # First: local exact/fuzzy lookup
+            # ------------------------------------------------
+
+            exact = (
+                self.medical_terminology
+                .local_exact_lookup(
+                    original_name
+                )
+            )
+
+            if exact and exact.matched:
+
+                print(
+                    "Medical terminology exact match: "
+                    f"{original_name} -> "
+                    f"{exact.normalized_name}"
+                )
+
+                return (
+                    exact.normalized_name
+                    or original_name
+                )
+
+            fuzzy = (
+                self.medical_terminology
+                .local_fuzzy_lookup(
+                    original_name,
+                    threshold=0.90
+                )
+            )
+
+            if fuzzy and fuzzy.matched:
+
+                print(
+                    "Medical terminology fuzzy match: "
+                    f"{original_name} -> "
+                    f"{fuzzy.normalized_name} "
+                    f"(score={fuzzy.confidence:.3f})"
+                )
+
+                return (
+                    fuzzy.normalized_name
+                    or original_name
+                )
+
+            # ------------------------------------------------
+            # External RxNorm approximate lookup
+            # ------------------------------------------------
+
+            try:
+
+                rxnorm_result = asyncio.run(
+                    self.medical_terminology
+                    .rxnorm_lookup(
+                        original_name
+                    )
+                )
+
+            except Exception as e:
+
+                print(
+                    "RxNorm lookup skipped: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+                rxnorm_result = None
+
+            if (
+                rxnorm_result
+                and rxnorm_result.matched
+                and rxnorm_result.normalized_name
+            ):
+
+                print(
+                    "Medical terminology RxNorm match: "
+                    f"{original_name} -> "
+                    f"{rxnorm_result.normalized_name} "
+                    f"(score={rxnorm_result.confidence:.3f})"
+                )
+
+                return (
+                    rxnorm_result.normalized_name
+                )
+
+        except Exception as e:
+
+            print(
+                "Medical terminology normalization failed "
+                f"for '{original_name}': "
+                f"{type(e).__name__}: {e}"
+            )
+
+        # ----------------------------------------------------
+        # No reliable match
+        # ----------------------------------------------------
+
+        return original_name
 
     # ========================================================
     # EXTRACT USING OLLAMA
@@ -163,6 +365,63 @@ class VoiceToPrescriptionPipeline:
         return medicines
 
     # ========================================================
+    # MEDICAL TERMINOLOGY NORMALIZATION
+    # ========================================================
+
+    def _normalize_extracted_medicines(
+        self,
+        extracted_medicines
+    ):
+        """
+        Normalize extracted medicine names using the
+        medical terminology service.
+
+        Other prescription fields are preserved exactly
+        as extracted.
+        """
+
+        normalized_medicines = []
+
+        for ext_med in extracted_medicines:
+
+            try:
+
+                original_name = getattr(
+                    ext_med,
+                    "name",
+                    ""
+                )
+
+                normalized_name = (
+                    self._normalize_medicine_name(
+                        original_name
+                    )
+                )
+
+                # Preserve all existing fields.
+                ext_med.name = normalized_name
+
+                normalized_medicines.append(
+                    ext_med
+                )
+
+            except Exception as e:
+
+                print(
+                    "Medicine normalization error:"
+                )
+
+                print(
+                    f"{type(e).__name__}: {e}"
+                )
+
+                normalized_medicines.append(
+                    ext_med
+                )
+
+        return normalized_medicines
+
+    # ========================================================
     # CONVERT EXTRACTED MEDICINES TO SCHEMA
     # ========================================================
 
@@ -187,19 +446,19 @@ class VoiceToPrescriptionPipeline:
                 dosage=(
                     ext_med.dosage
                     if ext_med.dosage
-                    else ""
+                    else None
                 ),
 
                 frequency=(
                     ext_med.frequency
                     if ext_med.frequency
-                    else ""
+                    else None
                 ),
 
                 duration=(
                     ext_med.duration
                     if ext_med.duration
-                    else ""
+                    else None
                 ),
 
                 route=(
@@ -211,7 +470,7 @@ class VoiceToPrescriptionPipeline:
                 instructions=(
                     ext_med.instructions
                     if ext_med.instructions
-                    else ""
+                    else None
                 ),
 
                 confidence=(
@@ -221,7 +480,9 @@ class VoiceToPrescriptionPipeline:
                 )
             )
 
-            medicines.append(med)
+            medicines.append(
+                med
+            )
 
         return Prescription(
 
@@ -243,6 +504,12 @@ class VoiceToPrescriptionPipeline:
         language: str = "en"
     ) -> ExtractionResult:
 
+        if (
+            not language
+            or language.lower() == "auto"
+        ):
+            language = "en"
+
         start_time = time.time()
 
         # ----------------------------------------------------
@@ -262,7 +529,8 @@ class VoiceToPrescriptionPipeline:
 
                 validation=ValidationResult(
                     isValid=False,
-                    issues=[]
+                    issues=[],
+                    missingFields=[]
                 ),
 
                 processingTimeMs=(
@@ -283,13 +551,16 @@ class VoiceToPrescriptionPipeline:
             language
         )
 
-        transcript = stt_result.get(
+        transcript = getattr(
+            stt_result,
             "text",
             ""
         )
 
-        stt_confidence = stt_result.get(
-            "confidence"
+        stt_confidence = getattr(
+            stt_result,
+            "confidence",
+            None
         )
 
         transcript = (
@@ -308,7 +579,8 @@ class VoiceToPrescriptionPipeline:
 
                 validation=ValidationResult(
                     isValid=False,
-                    issues=[]
+                    issues=[],
+                    missingFields=[]
                 ),
 
                 processingTimeMs=(
@@ -333,21 +605,21 @@ class VoiceToPrescriptionPipeline:
 
         except Exception as e:
 
-            # IMPORTANT:
-            # Do NOT silently switch to spaCy.
-            # We want Ollama to be the actual LLM.
-
             return ExtractionResult(
 
                 prescription=Prescription(
                     medicines=[],
-                    notes=f"Ollama extraction failed: {str(e)}",
+                    notes=(
+                        "Ollama extraction failed: "
+                        f"{str(e)}"
+                    ),
                     rawTranscript=transcript
                 ),
 
                 validation=ValidationResult(
                     isValid=False,
-                    issues=[]
+                    issues=[],
+                    missingFields=[]
                 ),
 
                 processingTimeMs=(
@@ -359,6 +631,17 @@ class VoiceToPrescriptionPipeline:
 
         # ----------------------------------------------------
         # STEP 3
+        # Medical terminology normalization
+        # ----------------------------------------------------
+
+        extracted_medicines = (
+            self._normalize_extracted_medicines(
+                extracted_medicines
+            )
+        )
+
+        # ----------------------------------------------------
+        # STEP 4
         # Build internal prescription schema
         # ----------------------------------------------------
 
@@ -368,7 +651,7 @@ class VoiceToPrescriptionPipeline:
         )
 
         # ----------------------------------------------------
-        # STEP 4
+        # STEP 5
         # Validate
         # ----------------------------------------------------
 
@@ -377,7 +660,7 @@ class VoiceToPrescriptionPipeline:
         )
 
         # ----------------------------------------------------
-        # STEP 5
+        # STEP 6
         # Return
         # ----------------------------------------------------
 
@@ -404,7 +687,6 @@ class VoiceToPrescriptionPipeline:
         self,
         prescription: Prescription
     ) -> Dict[str, Any]:
-
         """
         Convert internal prescription schema
         to exact Medhant Lite JSON structure.
@@ -424,8 +706,16 @@ class VoiceToPrescriptionPipeline:
         language: str = "en"
     ) -> ExtractionResult:
 
+        if (
+            not language
+            or language.lower() == "auto"
+        ):
+            language = "en"
+
         audio_data, sample_rate = (
-            load_audio_file(file_path)
+            load_audio_file(
+                file_path
+            )
         )
 
         return self.process_audio(
@@ -443,6 +733,12 @@ class VoiceToPrescriptionPipeline:
         base64_audio: str,
         language: str = "en"
     ) -> ExtractionResult:
+
+        if (
+            not language
+            or language.lower() == "auto"
+        ):
+            language = "en"
 
         audio_data, sample_rate = (
             decode_base64_audio(
@@ -483,7 +779,8 @@ class VoiceToPrescriptionPipeline:
 
                 validation=ValidationResult(
                     isValid=False,
-                    issues=[]
+                    issues=[],
+                    missingFields=[]
                 ),
 
                 processingTimeMs=0,
@@ -521,7 +818,8 @@ class VoiceToPrescriptionPipeline:
 
                 validation=ValidationResult(
                     isValid=False,
-                    issues=[]
+                    issues=[],
+                    missingFields=[]
                 ),
 
                 processingTimeMs=(
@@ -530,6 +828,16 @@ class VoiceToPrescriptionPipeline:
 
                 sttConfidence=None
             )
+
+        # ----------------------------------------------------
+        # MEDICAL TERMINOLOGY NORMALIZATION
+        # ----------------------------------------------------
+
+        extracted_medicines = (
+            self._normalize_extracted_medicines(
+                extracted_medicines
+            )
+        )
 
         # ----------------------------------------------------
         # BUILD PRESCRIPTION
@@ -588,11 +896,14 @@ def get_pipeline(
     if _pipeline_instance is None:
 
         # Always create with Ollama enabled
+
         if config is None:
 
             config = PipelineConfig(
+                whisper_model="base",
                 use_ollama_extraction=True,
                 use_spacy_fallback=False,
+                language="en",
                 ollama_config=OllamaConfig(
                     model="ministral-3:3b",
                     base_url="http://localhost:11434"
@@ -606,6 +917,13 @@ def get_pipeline(
 
             # Disable spaCy fallback
             config.use_spacy_fallback = False
+
+            # Default language
+            if not config.language:
+                config.language = "en"
+
+            # Always use BASE Whisper
+            config.whisper_model = "base"
 
             if config.ollama_config is None:
 
@@ -636,6 +954,16 @@ def create_pipeline(
 
     # Disable spaCy fallback
     config.use_spacy_fallback = False
+
+    # Use a valid faster-whisper language code.
+    if (
+        not config.language
+        or config.language.lower() == "auto"
+    ):
+        config.language = "en"
+
+    # Always use BASE Whisper.
+    config.whisper_model = "base"
 
     # Force Ministral
     if config.ollama_config is None:
